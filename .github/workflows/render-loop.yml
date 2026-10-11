@@ -1,0 +1,87 @@
+name: Render Black Hole loop (15 min)
+
+# Renders a 15-minute, 12-shot programme (6 shots Sagittarius A*, 6 shots M87*, fades between shots)
+# with software WebGL (no GPU). 13,500 frames at 15 fps are split into 150 shards rendered in
+# parallel; the join job concatenates them and frame-blends to a smooth 30 fps MP4, then publishes
+# it as a release asset. Expect a few hours in total (20 shards run at a time).
+# NOTE: public repos have free Actions minutes; on a private repo this uses several thousand minutes.
+on:
+  workflow_dispatch:
+    inputs:
+      quality:
+        description: "low | med | high (high is slower)"
+        default: "med"
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.m.outputs.shards }}
+    steps:
+      - id: m
+        run: echo "shards=$(python3 -c 'import json;print(json.dumps(list(range(150))))')" >> "$GITHUB_OUTPUT"
+
+  shards:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}   # 150 shards x 90 frames (6 s each at 15 fps)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Render shard ${{ matrix.shard }}
+        run: |
+          python render_loop.py --out part_$(printf '%03d' ${{ matrix.shard }}).mp4 \
+            --fps 15 --first $(( ${{ matrix.shard }} * 90 )) --count 90 --prog 1 \
+            --quality "${{ github.event.inputs.quality || 'med' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.shard }}
+          path: part_*.mp4
+          retention-days: 1
+
+  join:
+    needs: shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: parts
+          merge-multiple: true
+      - name: Join shards and convert to 30 fps
+        run: |
+          for f in $(ls parts/part_*.mp4 | sort); do echo "file '$PWD/$f'"; done > list.txt
+          test "$(wc -l < list.txt)" -eq 150
+          ffmpeg -hide_banner -loglevel warning -y -f concat -safe 0 -i list.txt -c copy joined15.mp4
+          ffmpeg -hide_banner -loglevel warning -y -i joined15.mp4 \
+            -vf "framerate=fps=30:interp_start=0:interp_end=255:scene=100" \
+            -c:v libx264 -preset medium -pix_fmt yuv420p -r 30 -b:v 4500k -maxrate 4500k -bufsize 9000k \
+            -g 60 -keyint_min 60 -sc_threshold 0 -movflags +faststart blackhole_loop.mp4
+          ffprobe -v error -show_entries format=duration -of csv=p=0 blackhole_loop.mp4   # expect ~900
+      - name: Publish to release "blackhole-loop"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view blackhole-loop >/dev/null 2>&1 || gh release create blackhole-loop --title "Black hole loop" --notes "Pre-rendered black hole loop"
+          gh release upload blackhole-loop blackhole_loop.mp4 --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blackhole_loop
+          path: blackhole_loop.mp4
